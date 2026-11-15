@@ -201,9 +201,10 @@ impl SimpleScsiDvd {
     pub fn change_media(&self, disk: Option<Disk>) {
         if let Some(disk) = disk {
             // Insert medium
-            let mut media = self.media.write();
-
+            // Lock order is `media_state` before `media`, as in
+            // `handle_start_stop_unit`.
             let mut media_state = self.media_state.lock();
+            let mut media = self.media.write();
             media_state.drive_state = DriveState::MediumPresentTrayOpen;
             media_state.pending_medium_event = IsoMediumEvent::NoMediaToMedia;
 
@@ -212,8 +213,8 @@ impl SimpleScsiDvd {
             tracing::debug!("completed host initiated insert");
         } else {
             // Eject medium
-            let mut media = self.media.write();
             let mut media_state = self.media_state.lock();
+            let mut media = self.media.write();
 
             // This will cause the next GESN or TUR command to report medium removal
             media_state.drive_state = DriveState::MediumNotPresentTrayOpen;
@@ -2656,6 +2657,26 @@ mod tests {
             true,
         )
         .await;
+    }
+
+    /// A host media change takes `media_state` before `media`, like a guest
+    /// eject, so that the two cannot deadlock.
+    #[test]
+    fn change_media_lock_order() {
+        let scsi_dvd = SimpleScsiDvd::new(None);
+        for disk in [Some(HookDisk::new(4096, 512).into_disk()), None] {
+            std::thread::scope(|s| {
+                // Hold a read lock so that change_media stops when it asks for
+                // `media`.
+                let media = scsi_dvd.media.read();
+                s.spawn(|| scsi_dvd.change_media(disk));
+                while !scsi_dvd.media.is_locked_exclusive() {
+                    std::thread::yield_now();
+                }
+                assert!(scsi_dvd.media_state.is_locked());
+                drop(media);
+            });
+        }
     }
 
     /// Sense data and a queued medium-change event are per-nexus too, and the
