@@ -412,64 +412,81 @@ impl Worker for UnderhillVmWorker {
     const ID: WorkerId<Self::Parameters> = UNDERHILL_WORKER;
 
     fn new(params: Self::Parameters) -> anyhow::Result<Self> {
-        pal_async::local::block_with_io(async |driver| {
-            let (get_infra, get_watchdog_task) = construct_get().await?;
-            let get_client = get_infra.get_client.clone();
+        // Quiesce the RCU domain each time the executor parks. The guest
+        // memory self test in `new_or_restart` registers this thread in the
+        // domain, and without quiescing, `synchronize_blocking` writers (e.g.
+        // underhill_mem's memory protection updates) must issue a
+        // process-wide memory barrier while this thread is blocked.
+        pal_async::local::block_with_io(|driver| {
+            minircu::global().quiesce_on_pending(async move {
+                let (get_infra, get_watchdog_task) = construct_get().await?;
+                let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
+                let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
 
-            if let Err(err) = &result {
-                tracing::error!(
-                    CVM_ALLOWED,
-                    error = err.as_ref() as &dyn std::error::Error,
-                    "failed to start VM"
-                );
+                if let Err(err) = &result {
+                    tracing::error!(
+                        CVM_ALLOWED,
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "failed to start VM"
+                    );
 
-                // Note that this probably will not return, since the host
-                // should terminate the VM in this case.
-                // Format error as raw string because the error is anyhow::Error
-                get_client
-                    .complete_start_vtl0(Some(format!("{:#}", err)))
-                    .await;
-            } else {
-                get_client.complete_start_vtl0(None).await;
-            }
+                    // Note that this probably will not return, since the host
+                    // should terminate the VM in this case.
+                    // Format error as raw string because the error is anyhow::Error
+                    get_client
+                        .complete_start_vtl0(Some(format!("{:#}", err)))
+                        .await;
+                } else {
+                    get_client.complete_start_vtl0(None).await;
+                }
 
-            result.map(|worker| UnderhillVmWorker {
-                _get_watchdog_task: Some(get_watchdog_task),
-                ..worker
+                result.map(|worker| UnderhillVmWorker {
+                    _get_watchdog_task: Some(get_watchdog_task),
+                    ..worker
+                })
             })
         })
     }
 
     fn restart(state: Self::State) -> anyhow::Result<Self> {
-        pal_async::local::block_with_io(async |driver| {
-            let (get_infra, get_watchdog_task) = construct_get().await?;
-            let result = Self::new_or_restart(
-                get_infra,
-                state.params,
-                false,
-                Some(state.servicing_state),
-                driver,
-            )
-            .await;
+        // As in `new`, quiesce the RCU domain each time the executor parks.
+        pal_async::local::block_with_io(|driver| {
+            minircu::global().quiesce_on_pending(async move {
+                let (get_infra, get_watchdog_task) = construct_get().await?;
+                let result = Self::new_or_restart(
+                    get_infra,
+                    state.params,
+                    false,
+                    Some(state.servicing_state),
+                    driver,
+                )
+                .await;
 
-            result.map(|worker| UnderhillVmWorker {
-                _get_watchdog_task: Some(get_watchdog_task),
-                ..worker
+                result.map(|worker| UnderhillVmWorker {
+                    _get_watchdog_task: Some(get_watchdog_task),
+                    ..worker
+                })
             })
         })
     }
 
     fn run(self, worker_rpc: mesh::Receiver<WorkerRpc<Self::State>>) -> anyhow::Result<()> {
-        let state = block_on(self.vm.run(
+        // This thread stays registered in the RCU domain after `new` and now
+        // blocks here for the life of the VM. Quiesce each time the future
+        // parks, so that `synchronize_blocking` writers do not have to issue
+        // a process-wide memory barrier on this thread's behalf.
+        let state = block_on(minircu::global().quiesce_on_pending(self.vm.run(
             &self.threadpool,
             self.is_post_servicing || !self.env_cfg.vtl0_starts_paused,
             self.servicing_correlation_id,
             self.vm_rpc,
             worker_rpc,
-        ));
+        )));
         tracing::info!(CVM_ALLOWED, "terminating worker");
+        // Don't rely on `quiesce_on_pending`'s behavior on completion; keep
+        // the thread quiesced while it joins the GET thread.
+        minircu::global().quiesce();
         self.get_thread.join().unwrap();
         if let Some(state) = state {
             let params = UnderhillWorkerParameters {

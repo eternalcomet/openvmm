@@ -113,6 +113,20 @@ impl<T: ?Sized> CloseableMutex<T> {
         Some(OpenGuard(self))
     }
 
+    /// If the lock is open and not currently held by anyone else, locks it
+    /// without blocking and returns a guard that can be used to access the
+    /// underlying value.
+    ///
+    /// Returns `None` if the lock is closed or held by another user.
+    pub fn try_lock_if_open(&self) -> Option<OpenGuard<'_, T>> {
+        let closed = self.mutex.try_lock()?;
+        if closed.closed {
+            return None;
+        }
+        MutexGuard::leak(closed);
+        Some(OpenGuard(self))
+    }
+
     /// Waits for the lock to become available and returns a guard that can be
     /// used to access the underlying value.
     ///

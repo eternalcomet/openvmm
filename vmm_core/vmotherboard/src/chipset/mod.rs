@@ -19,6 +19,7 @@ use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
 use closeable_mutex::CloseableMutex;
+use closeable_mutex::OpenGuard;
 use cvm_tracing::CVM_CONFIDENTIAL;
 use inspect::Inspect;
 use std::future::poll_fn;
@@ -166,7 +167,7 @@ impl Chipset {
     /// Dispatch a MMIO read to the given address.
     pub async fn mmio_read(&self, vp: u32, address: u64, data: &mut [u8]) {
         let lookup = self.mmio_ranges.lookup(address, true);
-        let r = lookup.dev.lock_if_open().map_or_else(
+        let r = lock_device_for_dispatch(&lookup.dev).map_or_else(
             || IoResult::Err(IoError::NoResponse),
             |mut dev| {
                 dev.supports_mmio()
@@ -190,7 +191,7 @@ impl Chipset {
     /// Dispatch a MMIO write to the given address.
     pub async fn mmio_write(&self, vp: u32, address: u64, data: &[u8]) {
         let lookup = self.mmio_ranges.lookup(address, false);
-        let r = lookup.dev.lock_if_open().map_or_else(
+        let r = lock_device_for_dispatch(&lookup.dev).map_or_else(
             || IoResult::Err(IoError::NoResponse),
             |mut dev| {
                 dev.supports_mmio()
@@ -219,7 +220,7 @@ impl Chipset {
     /// Dispatch a Port IO read to the given address.
     pub async fn io_read(&self, vp: u32, port: u16, data: &mut [u8]) {
         let lookup = self.pio_ranges.lookup(port, true);
-        let r = lookup.dev.lock_if_open().map_or_else(
+        let r = lock_device_for_dispatch(&lookup.dev).map_or_else(
             || IoResult::Err(IoError::NoResponse),
             |mut dev| {
                 dev.supports_pio()
@@ -243,7 +244,7 @@ impl Chipset {
     /// Dispatch a Port IO write to the given address.
     pub async fn io_write(&self, vp: u32, port: u16, data: &[u8]) {
         let lookup = self.pio_ranges.lookup(port, false);
-        let r = lookup.dev.lock_if_open().map_or_else(
+        let r = lock_device_for_dispatch(&lookup.dev).map_or_else(
             || IoResult::Err(IoError::NoResponse),
             |mut dev| {
                 dev.supports_pio()
@@ -289,6 +290,28 @@ impl Chipset {
             unreachable!("eoi exit received without a registered interrupt controller");
         }
     }
+}
+
+/// Locks the device for a synchronous dispatch, quiescing the global RCU
+/// domain first if the lock is contended.
+///
+/// Device handlers run synchronously under the device lock, and some can
+/// block for a while (e.g. OpenHCL's emulated RTC and PCI host bridge wait on
+/// the guest emulation transport). A VP thread reaching this dispatch may be
+/// registered in the RCU domain by guest memory accesses made while emulating
+/// the instruction, so without quiescing, concurrent `synchronize_blocking`
+/// writers must issue a process-wide memory barrier while it waits for the
+/// lock. The uncontended fast path skips the quiesce: such a dispatch does not
+/// block, and blocking waits inside a handler quiesce on their own. Quiescing
+/// is a no-op for threads that never entered the domain.
+fn lock_device_for_dispatch(
+    dev: &CloseableMutex<dyn ChipsetDevice>,
+) -> Option<OpenGuard<'_, dyn ChipsetDevice>> {
+    if let Some(dev) = dev.try_lock_if_open() {
+        return Some(dev);
+    }
+    minircu::global().quiesce();
+    dev.lock_if_open()
 }
 
 #[derive(Debug)]

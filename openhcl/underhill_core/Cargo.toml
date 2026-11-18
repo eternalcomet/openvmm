@@ -148,6 +148,7 @@ mesh_protobuf.workspace = true
 mesh_worker.workspace = true
 mesh.workspace = true
 mesh_tracing.workspace = true
+minircu.workspace = true
 pal_async.workspace = true
 pal_uring.workspace = true
 pal.workspace = true

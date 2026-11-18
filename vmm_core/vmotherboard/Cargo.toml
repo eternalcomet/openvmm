@@ -45,6 +45,7 @@ cvm_tracing.workspace = true
 inspect_counters.workspace = true
 inspect.workspace = true
 mesh.workspace = true
+minircu.workspace = true
 pal_async.workspace = true
 range_map_vec.workspace = true
 tracelimit.workspace = true

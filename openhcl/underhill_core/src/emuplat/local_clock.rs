@@ -133,7 +133,15 @@ impl LocalClock for UnderhillLocalClock {
         let raw_skew: i64 = new_skew.as_millis() * 10_000; // millis to 100ns units
 
         // TODO: swap this out for a non-blocking version that guarantees the skew is written out _eventually_
-        let res = pal_async::local::block_on(self.store.persist(raw_skew.to_le_bytes().into()));
+        //
+        // Quiesce the RCU domain while blocked. The calling thread (e.g. a VP
+        // thread that reached this through port I/O emulation) may be
+        // registered in the domain by earlier guest memory accesses, and
+        // without quiescing, `synchronize_blocking` writers must issue a
+        // process-wide memory barrier while it is blocked here.
+        let res = pal_async::local::block_on(
+            minircu::global().quiesce_on_pending(self.store.persist(raw_skew.to_le_bytes().into())),
+        );
         if let Err(err) = res {
             tracing::error!(
                 CVM_ALLOWED,
@@ -199,6 +207,12 @@ mod host_time {
             //
             // ...but this is fine for now.
             let now = Instant::now();
+            // Quiesce before blocking on the cache lock: it is held across the
+            // GET wait below, and a VP thread waiting here (registered in the
+            // RCU domain by guest memory accesses during instruction
+            // emulation) would otherwise force `synchronize_blocking` writers
+            // to issue a process-wide memory barrier.
+            minircu::global().quiesce();
             let mut cached_host_time = self.cached_host_time.lock();
 
             match &*cached_host_time {
@@ -210,8 +224,13 @@ mod host_time {
                 _ => {
                     // TODO: this block_on really ain't great, but since we're
                     // not hammering the GET on _each_ access, it's okay for now...
-                    let new_time =
-                        pal_async::local::block_with_io(|_| self.get.host_time()).to_jiff();
+                    //
+                    // Quiesce the RCU domain while blocked on the GET; see
+                    // `set_time` for why.
+                    let new_time = pal_async::local::block_with_io(|_| {
+                        minircu::global().quiesce_on_pending(self.get.host_time())
+                    })
+                    .to_jiff();
                     let result = new_time.clone();
                     *cached_host_time = Some((now, new_time));
                     result
@@ -240,12 +259,21 @@ impl ArcMutexUnderhillLocalClock {
 }
 
 // required for emuplat servicing optimization
+//
+// Both methods can block on the shared clock lock, which is held across the
+// GET waits inside (host time query, VMGS persist). Quiesce before taking the
+// lock: a VP thread reaching this through port I/O emulation may be registered
+// in the RCU domain by earlier guest memory accesses, and without quiescing,
+// `synchronize_blocking` writers must issue a process-wide memory barrier
+// while it is blocked here.
 impl LocalClock for ArcMutexUnderhillLocalClock {
     fn get_time(&mut self) -> LocalClockTime {
+        minircu::global().quiesce();
         self.0.lock().get_time()
     }
 
     fn set_time(&mut self, new_time: LocalClockTime) {
+        minircu::global().quiesce();
         self.0.lock().set_time(new_time)
     }
 }

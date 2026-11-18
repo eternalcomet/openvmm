@@ -232,7 +232,13 @@ impl AdjustGpaRange for GetBackedAdjustGpaRange {
         // the GET runs on a separate thread from the VP threads and has no
         // dependencies on tasks on the VP threads, and this will never be
         // called from the GET thread.
-        pal_async::local::block_on(self.adjust(range, state))
+        //
+        // Quiesce the RCU domain while blocked: the calling VP thread is
+        // registered in the domain by guest memory accesses made while
+        // emulating the instruction that triggered this, and without
+        // quiescing, `synchronize_blocking` writers must issue a
+        // process-wide memory barrier while it is blocked here.
+        pal_async::local::block_on(minircu::global().quiesce_on_pending(self.adjust(range, state)))
     }
 }
 
@@ -243,6 +249,12 @@ pub struct ArcMutexGetBackedAdjustGpaRange(
 // required for emuplat servicing optimization
 impl AdjustGpaRange for ArcMutexGetBackedAdjustGpaRange {
     fn adjust_gpa_range(&mut self, range: MemoryRange, state: GpaState) {
+        // Quiesce before blocking on the lock: it is held across the GET wait
+        // inside, and a VP thread waiting here (registered in the RCU domain
+        // by guest memory accesses during instruction emulation) would
+        // otherwise force `synchronize_blocking` writers to issue a
+        // process-wide memory barrier.
+        minircu::global().quiesce();
         self.0.lock().adjust_gpa_range(range, state)
     }
 }
